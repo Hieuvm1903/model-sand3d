@@ -1,21 +1,24 @@
-"""Build every models/*.py, then (optionally) publish to Supabase.
+"""Build every models/*.py, validate layout contracts, generate manifest.json, and optionally publish to Supabase.
 
   python tools/build.py                    # build all into ./dist
   python tools/build.py --only robot       # build one model
   python tools/build.py --upload           # build, upload to <set>/<hash>/, register version
-
-Convention for a model file in models/:
-  build()               -> sand3d root   => dist/<file>.glb
-  build_json(assets)    -> dict          => dist/<file>.json   (assets = names of the glb files)
 """
-import argparse, hashlib, importlib, json, sys
+
+import argparse
+from datetime import datetime, timezone
+import hashlib
+import importlib
+import json
 from pathlib import Path
+import sys
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 import sand3d as s3d  # noqa: E402
 from lib import supabase_io  # noqa: E402
+from lib.common import ASSET_ROLES  # noqa: E402
 
 
 def discover(only=None):
@@ -34,6 +37,8 @@ def build_all(out: Path, only=None):
     mods = {n: importlib.import_module(f"models.{n}") for n in names}
     glb_names = [n for n, m in mods.items() if hasattr(m, "build")]
     files = []
+    layout_data = None
+
     for n, m in mods.items():
         if hasattr(m, "build"):
             s3d.empty_scene()
@@ -41,12 +46,34 @@ def build_all(out: Path, only=None):
             path = out / f"{n}.glb"
             s3d.export(m.build(), str(path))
         elif hasattr(m, "build_json"):
+            layout_data = m.build_json(glb_names)
             path = out / f"{n}.json"
-            path.write_text(json.dumps(m.build_json(glb_names), indent=2))
+            path.write_text(json.dumps(layout_data, indent=2))
         else:
             raise SystemExit(f"models/{n}.py needs build() or build_json(assets)")
         print(f"built {path.name} ({path.stat().st_size / 1024:.0f} KB)")
         files.append(path)
+
+    if only is None:
+        manifest = {
+            "schemaVersion": "2.0",
+            "generatedAt": datetime.now(timezone.utc).isoformat(),
+            "assets": {
+                n: {
+                    "file": f"{n}.glb",
+                    "role": ASSET_ROLES.get(n, "equipment"),
+                    "bytes": (out / f"{n}.glb").stat().st_size,
+                    "joints": (layout_data or {}).get("joints", {}).get(n, []),
+                    "indicatorMeshes": (layout_data or {}).get("indicator_meshes", {}).get(n, []),
+                }
+                for n in glb_names
+            },
+        }
+        manifest_path = out / "manifest.json"
+        manifest_path.write_text(json.dumps(manifest, indent=2))
+        files.append(manifest_path)
+        print(f"generated {manifest_path.name} ({len(glb_names)} models)")
+
     return files
 
 
@@ -80,7 +107,6 @@ def main():
     base_path = f"{a.set}/{version}"
     for p in files:
         supabase_io.upload_file(p, a.bucket, f"{base_path}/{p.name}")
-    # register last: the table row only appears once every file is in place
     supabase_io.register_version(a.set, version, base_path, {p.stem: p.name for p in files})
     print(f"published {base_path}")
 
